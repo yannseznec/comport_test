@@ -23,6 +23,8 @@
 #X obj 433 167 ctlin 16;
 #X obj 433 212 print midi1;
 #X obj 44 179 comport 0 9600;
+#X msg 173 148 info;
+#X obj 196 214 print;
 #X connect 0 0 1 0;
 #X connect 1 0 11 0;
 #X connect 2 0 23 0;
@@ -31,6 +33,7 @@
 #X connect 5 0 15 0;
 #X connect 6 0 16 0;
 #X connect 7 0 2 0;
+#X connect 7 0 24 0;
 #X connect 8 0 23 0;
 #X connect 11 0 5 0;
 #X connect 11 1 6 0;
@@ -45,3 +48,5 @@
 #X connect 20 0 22 0;
 #X connect 21 0 20 0;
 #X connect 23 0 13 0;
+#X connect 23 1 25 0;
+#X connect 24 0 23 0;
