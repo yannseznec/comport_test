@@ -46,6 +46,7 @@ MP 20100201 use a buffer for writes, write takes place during clock callback com
 #include <errno.h>
 #include <stdio.h>
 
+#define comport_verbose if(x->verbose > 0)post
 
 typedef struct comport
 {
@@ -224,8 +225,8 @@ static long baudratetable[] =
             B57600
             B115200
             B230400
-  The  zero  baud rate, B0, is used to terminate the connec­
-  tion.  If B0 is specified, the modem control  lines  shall
+  The  zero  baud rate, B0, is used to terminate the connection.
+  If B0 is specified, the modem control  lines  shall
   no longer be asserted.  Normally, this will disconnect the
   line.*/
 
@@ -240,6 +241,7 @@ static float set_parity(t_comport *x,int n);
 static float set_stopflag(t_comport *x, t_float nr);
 static int set_ctsrts(t_comport *x, int nr);
 static int set_dtr(t_comport *x, int nr);
+static int set_break(t_comport *x, int on);
 static int set_rts(t_comport *x, int nr);
 static int set_xonxoff(t_comport *x, int nr);
 static int set_serial(t_comport *x);
@@ -254,7 +256,7 @@ static HANDLE close_serial(t_comport *x);
 static int set_hupcl(t_comport *x, int nr);
 static int open_serial(unsigned int com_num, t_comport *x);
 static int close_serial(t_comport *x);
-static long get_baud_ratebits(t_float *baud);
+static long get_baud_ratebits(long *baud);
 #endif
 static void comport_pollintervall(t_comport *x, t_floatarg g);
 static void comport_tick(t_comport *x);
@@ -269,6 +271,7 @@ static void comport_stopbit(t_comport *x,t_floatarg f);
 static void comport_rtscts(t_comport *x,t_floatarg f);
 static void comport_dtr(t_comport *x,t_floatarg f);
 static void comport_rts(t_comport *x,t_floatarg f);
+static void comport_break(t_comport *x,t_floatarg f);
 static void comport_xonxoff(t_comport *x,t_floatarg f);
 static void comport_hupcl(t_comport *x,t_floatarg f);
 static void comport_close(t_comport *x);
@@ -291,7 +294,7 @@ static void comport_enum(t_comport *x);
 static void comport_info(t_comport *x);
 static void comport_devices(t_comport *x);
 static void comport_ports(t_comport *x);
-static void comport_verbose(t_comport *x, t_floatarg f);
+static void comport_set_verbose(t_comport *x, t_floatarg f);
 static void comport_help(t_comport *x);
 void comport_setup(void);
 
@@ -363,7 +366,7 @@ static float set_stopflag(t_comport *x, t_float nr)
         x->dcb.StopBits = 1; /*  ONE5STOPBITS = 1  */
         return nr;
     }
-    post("comport stopbit number (%g) out of range (0, 1.5, 2)", nr);
+    pd_error(x, "comport stopbit number (%g) out of range (0, 1.5, 2)", nr);
     return 0;
 }
 
@@ -404,6 +407,19 @@ static int set_rts(t_comport *x, int nr)
 
     status = EscapeCommFunction(fd, dwFunc);
     if (status != 0) return nr;
+    return -1; /* didn't work, GetLastError tells why */
+}
+
+static int set_break(t_comport *x, int on)
+{
+    HANDLE  fd = x->comhandle;
+    BOOL    status;
+    DWORD   dwFunc = (on==0)?CLRBREAK:SETBREAK;
+
+    if (fd == INVALID_HANDLE_VALUE) return -1;
+
+    status = EscapeCommFunction(fd, dwFunc);
+    if (status != 0) return on;
     return -1; /* didn't work, GetLastError tells why */
 }
 
@@ -457,7 +473,7 @@ static HANDLE open_serial(unsigned int com_num, t_comport *x)
     {
         if(com_num < 1 || com_num >= COMPORT_MAX)
         {
-            post("comport number %d out of range (1-%d)", com_num, COMPORT_MAX);
+            pd_error(x, "comport number %d out of range (1-%d)", com_num, COMPORT_MAX);
             return INVALID_HANDLE_VALUE;
         }
 #ifdef _MSC_VER
@@ -476,7 +492,7 @@ static HANDLE open_serial(unsigned int com_num, t_comport *x)
 #endif
         x->serial_device = gensym(buffer);
     }
-    post("Opening %s", &x->serial_device->s_name[4]);/* skip slashes and dot */
+    comport_verbose("[comport] Opening %s", &x->serial_device->s_name[4]);/* skip slashes and dot */
     fd = CreateFileA( x->serial_device->s_name,
         GENERIC_READ | GENERIC_WRITE,
         0,
@@ -569,7 +585,7 @@ static HANDLE open_serial(unsigned int com_num, t_comport *x)
     }
     if(set_serial(x))
     {
-        post("[comport] opened serial line device %d (%s)\n",
+        comport_verbose("[comport] opened serial line device %d (%s)\n",
             com_num, &x->serial_device->s_name[4]);
     }
     else
@@ -582,7 +598,7 @@ static HANDLE open_serial(unsigned int com_num, t_comport *x)
 
     if (!GetCommTimeouts(fd, &(x->old_timeouts)))
     {
-        post("[comport] Couldn't get old timeouts for serial device (%d)", GetLastError());
+        pd_error(x, "[comport] Couldn't get old timeouts for serial device (%d)", GetLastError());
     }
 
     /* setting new timeouts for read to immediately return */
@@ -594,12 +610,12 @@ static HANDLE open_serial(unsigned int com_num, t_comport *x)
 
     if (!SetCommTimeouts(fd, &timeouts))
     {
-        post("Couldn't set timeouts for serial device (%d)", GetLastError());
+        pd_error(x, "Couldn't set timeouts for serial device (%d)", GetLastError());
         return INVALID_HANDLE_VALUE;
     }
     if (!SetupComm(x->comhandle, 4096L, 4096L))/* try to get big buffers to avoid overruns*/
     {
-        post("[comport] Couldn't do SetupComm (%d)", GetLastError());
+        pd_error(x, "[comport] Couldn't do SetupComm (%d)", GetLastError());
     }
     x->comport = com_num;/* output on next tick */
     return fd;
@@ -611,15 +627,15 @@ static HANDLE close_serial(t_comport *x)
     {
         if (!SetCommState(x->comhandle, &(x->dcb_old)))
         {
-            post("[comport] ** ERROR ** couldn't reset params to DCB of device %s\n",
+            pd_error(x, "[comport] ** ERROR ** couldn't reset params to DCB of device %s\n",
             &x->serial_device->s_name[4]);
         }
         if (!SetCommTimeouts(x->comhandle, &(x->old_timeouts)))
         {
-            post("[comport] Couldn't reset old_timeouts for serial device");
+            pd_error(x, "[comport] Couldn't reset old_timeouts for serial device");
         }
         CloseHandle(x->comhandle);
-        post("[comport] closed %s", &x->serial_device->s_name[4]);
+        comport_verbose("[comport] closed %s", &x->serial_device->s_name[4]);
     }
     return INVALID_HANDLE_VALUE;
 }
@@ -667,20 +683,19 @@ int comport_get_cts(t_comport *x)
 #else /* NT */
 /* ----------------- POSIX - UNIX ------------------------------ */
 
-
-static long get_baud_ratebits(t_float *baud)
+static long get_baud_ratebits(long *baud)
 {
     int i = 0;
 
     while(i < BAUDRATETABLE_LEN && baudratetable[i] > *baud) i++;
 
     if(baudratetable[i] != *baud)
-        post("[comport]: %d not valid, using closest value: ", *baud, baudratetable[i]);
+        error("[comport]: %ld not valid, using closest value: %ld", *baud, baudratetable[i]);
 
     /* nearest Baudrate finding */
     if(i==BAUDRATETABLE_LEN ||  baudspeedbittable[i] < 0)
     {
-        post("*Warning* The baud rate %d is not supported or out of range, using 9600\n",*baud);
+        error("*Warning* The baud rate %ld is not supported or out of range, using 9600\n",*baud);
         i = 8;
     }
     *baud =  baudratetable[i];
@@ -688,17 +703,17 @@ static long get_baud_ratebits(t_float *baud)
     return baudspeedbittable[i];
 }
 
-static float set_baudrate(t_comport *x, t_float baud)
+static float set_baudrate(t_comport *x, t_float fbaud)
 {
     struct termios  *tio = &(x->com_termio);
+    long            baud = fbaud;
     speed_t         baudbits = get_baud_ratebits(&baud);
 
-    if (x->verbose > 0)
-        post("[comport] set_baudrate: Setting baud rate to %g with baudbits 0x%X", baud, baudbits);
+    comport_verbose("[comport] set_baudrate: Setting baud rate to %g with baudbits 0x%X", baud, baudbits);
     if( cfsetispeed(tio, baudbits) != 0 )
-        post("[comport]: ERROR failed to set bitrate: %d", baudbits);
+        pd_error(x, "[comport]: ERROR failed to set bitrate: %d", baudbits);
     if( cfsetospeed(tio, baudbits) != 0 )
-        post("[comport]: ERROR failed to set bitrate: %d", baudbits);
+        pd_error(x, "[comport]: ERROR failed to set bitrate: %d", baudbits);
 
     return baud;
 }
@@ -838,6 +853,21 @@ static int set_hupcl(t_comport *x, int nr)
     return 1;
 }
 
+static int set_break(t_comport *x, int on)
+{
+    int fd = x->comhandle;
+    int status;
+
+    if (fd == INVALID_HANDLE_VALUE) return -1;
+
+    if (on == 0)
+      status = ioctl(fd, TIOCCBRK); // Turn break off, that is, stop sending zero bits.
+    else
+      status = ioctl(fd, TIOCSBRK); // Turn break on, that is, start sending zero bits.
+
+    return ((status < 0)? status: (on != 0));
+}
+
 static int open_serial(unsigned int com_num, t_comport *x)
 {
     int             fd;
@@ -850,7 +880,7 @@ static int open_serial(unsigned int com_num, t_comport *x)
     /* if com_num == USE_DEVICENAME, use device name directly, else try port # */
     if((com_num != USE_DEVICENAME)&&(com_num >= COMPORT_MAX))
     {
-        post("[comport] ** WARNING ** port %d not valid, must be between 0 and %d",
+        pd_error(x, "[comport] ** WARNING ** port %d not valid, must be between 0 and %d",
             com_num, COMPORT_MAX - 1);
         return INVALID_HANDLE_VALUE;
     }
@@ -888,8 +918,8 @@ static int open_serial(unsigned int com_num, t_comport *x)
         x->serial_device = gensym(glob_buffer.gl_pathv[com_num]);
     else
     {
-        post("[comport] ** WARNING ** port #%d does not exist! (max == %d)",
-            com_num,glob_buffer.gl_pathc - 1);
+        pd_error(x, "[comport] ** WARNING ** port #%d does not exist! (max == %lu)",
+                 com_num,(unsigned long)(glob_buffer.gl_pathc - 1));
         return INVALID_HANDLE_VALUE;
     }
     globfree( &(glob_buffer) );
@@ -945,7 +975,7 @@ static int open_serial(unsigned int com_num, t_comport *x)
 
     if(tcsetattr(fd, TCSAFLUSH, new) != -1)
     {
-        post("[comport] opened serial line device %d (%s)\n",
+        comport_verbose("[comport] opened serial line device %d (%s)\n",
             com_num,x->serial_device->s_name);
     }
     else
@@ -968,7 +998,7 @@ static int close_serial(t_comport *x)
     {
         tcsetattr(fd, TCSANOW, tios);
         close(fd);
-        post("[comport] closed port %i (%s)", x->comport, x->serial_device->s_name);
+        comport_verbose("[comport] closed port %i (%s)", x->comport, x->serial_device->s_name);
     }
     return INVALID_HANDLE_VALUE;
 }
@@ -1053,6 +1083,7 @@ static void comport_tick(t_comport *x)
         /*osReader.Pointer = 0; seems MinGW doesn't knoow about this one */
         osReader.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
         if(ReadFile(x->comhandle, x->x_inbuf, x->x_inbuf_len, &dwRead, &osReader))
+        //if (ReadFile(x->comhandle, x->x_inbuf, NULL, &dwRead, &osReader))
         {
             if(dwRead > 0)
             {
@@ -1064,8 +1095,28 @@ static void comport_tick(t_comport *x)
         }
         else
         {
-            err = -1;
             whicherr = GetLastError();
+            if (whicherr == ERROR_IO_PENDING)
+            {
+                //post("iopending\n");
+                if (GetOverlappedResult(x->comhandle, &osReader, &dwRead, FALSE)) // don't wait
+                {
+                    //post("dwRead %ld\n", dwRead);
+                    if (dwRead > 0)
+                    {
+                        for (dwX = 0; dwX < dwRead;dwX++)
+                        {
+                            outlet_float(x->x_data_outlet, (t_float)x->x_inbuf[dwX]);
+                        }
+                    }
+                }
+                else
+                {
+                    whicherr = GetLastError();
+                    if (whicherr != ERROR_IO_PENDING) err = -1;
+                }
+            }
+            else err = -1;
         }
         CloseHandle(osReader.hEvent);
 #else
@@ -1123,7 +1174,7 @@ static void comport_tick(t_comport *x)
         if(err < 0)
         { /* if a read error detected */
             if(x->rxerrors < 10) /* ten times max */
-                post("[comport]: RXERRORS on serial line (%d)\n", whicherr);
+                pd_error(x, "[comport]: RXERRORS on serial line (%d)\n", whicherr);
             x->rxerrors++; /* remember */
         }
 /* now if anything to send, send the output buffer */
@@ -1147,7 +1198,7 @@ static void comport_tick(t_comport *x)
             osWrite.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
             if (osWrite.hEvent == NULL)
             {
-                post("[comport]: Couldn't create event. Transmission aborted.");
+                pd_error(x, "[comport]: Couldn't create event. Transmission aborted.");
                 goto endsendevent;
             }
 
@@ -1156,14 +1207,14 @@ static void comport_tick(t_comport *x)
                 dwErr = GetLastError();
                 if (dwErr != ERROR_IO_PENDING)
                 {
-                    post("[comport]: WriteFile error: %d", (int)dwErr);
+                    pd_error(x, "[comport]: WriteFile error: %d", (int)dwErr);
                     goto endsendevent;
                 }
             }
             if (!GetOverlappedResult(x->comhandle, &osWrite, &numTransferred, TRUE))
             {/* wait for the character(s) to be sent */
                 dwErr = GetLastError();
-                post("[comport]: WriteFile:GetOverlappedResult error: %d", (int)dwErr);
+                pd_error(x, "[comport]: WriteFile:GetOverlappedResult error: %d", (int)dwErr);
             }
 endsendevent:
             CloseHandle(osWrite.hEvent);
@@ -1184,7 +1235,7 @@ static int write_serial(t_comport *x, unsigned char  serial_byte)
 {
     if(x->comhandle == INVALID_HANDLE_VALUE)
     {
-        post ("[comport]: Serial port is not open");
+        comport_verbose ("[comport]: Serial port is not open");
         return 0;         
     }
     else if(x->x_outbuf_wr_index < x->x_outbuf_len)
@@ -1193,7 +1244,7 @@ static int write_serial(t_comport *x, unsigned char  serial_byte)
         return 1;
     }    
     /* handle overrun error */
-    post ("[comport]: buffer is full");
+    pd_error (x, "[comport]: buffer is full");
     return 0;
 }
 
@@ -1202,12 +1253,12 @@ static int write_serials(t_comport *x, unsigned char *serial_buf, int buf_length
     int i;
     if(x->comhandle == INVALID_HANDLE_VALUE)
     {
-        post ("[comport]: Serial port is not open");
+        pd_error (x, "[comport]: Serial port is not open");
         return 0;         
     }
     for (i = 0; ((i < buf_length) && (x->x_outbuf_wr_index < x->x_outbuf_len)); ++x->x_outbuf_wr_index, ++i)
         x->x_outbuf[x->x_outbuf_wr_index] = serial_buf[i];
-    if (i != buf_length) post ("[comport]: buffer is full");
+    if (i != buf_length) pd_error (x, "[comport]: buffer is full");
     return i;
 }
 
@@ -1217,7 +1268,7 @@ static void comport_float(t_comport *x, t_float f)
 
     if (write_serial(x,serial_byte) != 1)
     {
-        post("Write error, maybe TX-OVERRUNS on serial line");
+        pd_error(x, "Write error, maybe TX-OVERRUNS on serial line");
     }
 }
 
@@ -1225,17 +1276,16 @@ static void comport_list(t_comport *x, t_symbol *s, int argc, t_atom *argv)
 {
     unsigned char   temp_array[COMPORT_BUF_SIZE];/* arbitrary maximum list length */
     int             i, count;
-    int             result;
 
     count = argc;
     if (argc > COMPORT_BUF_SIZE)
     {
-        post ("[comport] truncated list of %d elements to %d", argc, count);
+        pd_error (x, "[comport] truncated list of %d elements to %d", argc, count);
         count = COMPORT_BUF_SIZE;
     }
     for(i = 0; i < count; i++)
         temp_array[i] = ((unsigned char)atom_getint(argv+i))&0xFF; /* brutal conv */
-    result = write_serials(x, temp_array, count);
+    write_serials(x, temp_array, count);
 }
 
 static void *comport_new(t_symbol *s, int argc, t_atom *argv)
@@ -1273,7 +1323,12 @@ allows COM port numbers to be specified. */
 
 /*	 Open the Comport for RD and WR and get a handle */
 /* this line should use a real serial device */
-    strncpy(test.serial_device_prefix, serial_device_prefix, strlen(serial_device_prefix)+1);
+//#ifdef _MSC_VER
+#ifdef _WIN32
+    strncpy_s(test.serial_device_prefix, strlen(serial_device_prefix) + 1, serial_device_prefix, strlen(serial_device_prefix) + 1);
+#else
+    strncpy(test.serial_device_prefix, serial_device_prefix, strlen(serial_device_prefix) + 1);
+#endif
     test.baud = fbaud;
     test.data_bits = 8; /* default 8 data bits */
     test.parity_bit = 0;/* default no parity bit */
@@ -1291,7 +1346,12 @@ allows COM port numbers to be specified. */
     x = (t_comport *)pd_new(comport_class);
 
     x->comport = test.comport;/* com_num */
-    strncpy(x->serial_device_prefix,serial_device_prefix,strlen(serial_device_prefix)+1);
+//#ifdef _MSC_VER
+#ifdef _WIN32
+    strncpy_s(x->serial_device_prefix, strlen(serial_device_prefix) + 1, serial_device_prefix, strlen(serial_device_prefix) + 1);
+#else
+    strncpy(x->serial_device_prefix, serial_device_prefix, strlen(serial_device_prefix) + 1);
+#endif
     x->serial_device = test.serial_device; /* we need this so 'help' doesn't crash */
 
     x->baud = test.baud;
@@ -1361,7 +1421,7 @@ allows COM port numbers to be specified. */
 
 static void comport_free(t_comport *x)
 {
-    post("[comport] free serial...");
+    comport_verbose("[comport] free serial...");
     clock_unset(x->x_clock);
     clock_free(x->x_clock);
     x->comhandle = close_serial(x);
@@ -1375,7 +1435,7 @@ static void comport_baud(t_comport *x,t_floatarg f)
 {
     if(f == x->baud)
     {
-        post("baudrate already %g\n",x->baud);
+        comport_verbose("[comport] baudrate already %g\n",x->baud);
         return;
     }
 
@@ -1392,8 +1452,7 @@ static void comport_baud(t_comport *x,t_floatarg f)
             x->serial_device->s_name);
 #endif
     }
-    else if(x->verbose > 0)
-        post("set baudrate of %s to %g\n",
+    else comport_verbose("[comport] set baudrate of %s to %g\n",
 #ifdef _WIN32
             &x->serial_device->s_name[4], x->baud);
 #else
@@ -1417,8 +1476,7 @@ static void comport_bits(t_comport *x,t_floatarg f)
 #endif
         return;
     }
-    else if(x->verbose > 0)
-        post("set bits of %s to %g\n",
+    else comport_verbose("[comport] set bits of %s to %g\n",
 #ifdef _WIN32
             &x->serial_device->s_name[4], f);
 #else
@@ -1444,8 +1502,7 @@ static void comport_parity(t_comport *x,t_floatarg f)
 #endif
         return;
     }
-    else if(x->verbose > 0)
-        post("[comport] set extra paritybit of %s to %g\n",
+    else comport_verbose("[comport] set extra paritybit of %s to %g\n",
 #ifdef _WIN32
             &x->serial_device->s_name[4], f);
 #else
@@ -1463,7 +1520,7 @@ static void comport_stopbit(t_comport *x, t_floatarg f)
     if(set_serial(x) == 0)
     {
 #ifdef _WIN32
-        pd_error(,"[comport] ** ERROR ** could not set stopbits of device %s to %g\n",
+        pd_error(x,"[comport] ** ERROR ** could not set stopbits of device %s to %g\n",
             &x->serial_device->s_name[4], f);
 #else
         pd_error(x,"[comport] ** ERROR ** could not set extra stopbit of device %s\n",
@@ -1471,12 +1528,12 @@ static void comport_stopbit(t_comport *x, t_floatarg f)
 #endif
         return;
     }
-    else if(x->verbose > 0)
+    else comport_verbose
 #ifdef _WIN32
-        post("[comport] set stopbits of %s to %g\n",
+        ("[comport] set stopbits of %s to %g\n",
             &x->serial_device->s_name[4], f);
 #else
-        post("[comport] set extra stopbit of %s to %g\n",
+        ("[comport] set extra stopbit of %s to %g\n",
             x->serial_device->s_name, f);
 #endif
     x->stop_bits = f;
@@ -1498,8 +1555,7 @@ static void comport_rtscts(t_comport *x,t_floatarg f)
 #endif
         return;
     }
-    else if(x->verbose > 0)
-        post("[comport] set rts-cts of %s to %g\n",
+    else comport_verbose("[comport] set rts-cts of %s to %g\n",
 #ifdef _WIN32
             &x->serial_device->s_name[4], f);
 #else
@@ -1523,8 +1579,7 @@ static void comport_dtr(t_comport *x,t_floatarg f)
             x->serial_device->s_name);
 #endif
     }
-    else if(x->verbose > 0)
-        post("[comport] set dtr of %s to %g\n",
+    else comport_verbose("[comport] set dtr of %s to %g\n",
 #ifdef _WIN32
             &x->serial_device->s_name[4], f);
 #else
@@ -1547,8 +1602,30 @@ static void comport_rts(t_comport *x,t_floatarg f)
             x->serial_device->s_name);
 #endif
     }
-    else if(x->verbose > 0)
-        post("[comport] set rts of %s to %g\n",
+    else comport_verbose("[comport] set rts of %s to %g\n",
+#ifdef _WIN32
+            &x->serial_device->s_name[4], f);
+#else
+            x->serial_device->s_name, f);
+#endif
+}
+
+static void comport_break(t_comport *x,t_floatarg f)
+{
+    f = set_break(x,f);
+
+    if(x->comhandle == INVALID_HANDLE_VALUE)return;
+
+    if(f < 0)
+    {
+        pd_error(x,"[comport] ** ERROR ** could not set break of device %s\n",
+#ifdef _WIN32
+            &x->serial_device->s_name[4]);
+#else
+            x->serial_device->s_name);
+#endif
+    }
+    else comport_verbose("[comport] set break of %s to %g\n",
 #ifdef _WIN32
             &x->serial_device->s_name[4], f);
 #else
@@ -1572,8 +1649,7 @@ static void comport_xonxoff(t_comport *x,t_floatarg f)
 #endif
         return;
     }
-    else if(x->verbose > 0)
-        post("[comport] set xonxoff of %s to %g\n",
+    else comport_verbose("[comport] set xonxoff of %s to %g\n",
 #ifdef _WIN32
         &x->serial_device->s_name[4], f);
 #else
@@ -1669,7 +1745,7 @@ static void comport_enum(t_comport *x)
         else
             CloseHandle(fd);
         if (dw == 0)post("\t%d - COM%d (free)", i, i);
-        else if (dw == ERROR_ACCESS_DENIED)post("\t%d - COM%d (in use)", i, i);
+        else if (dw == ERROR_ACCESS_DENIED)pd_error(x, "\t%d - COM%d (in use)", i, i);
     }
 #else
     unsigned int i;
@@ -1702,7 +1778,7 @@ static void comport_enum(t_comport *x)
 /* now see if it has attributes */
             if ((tcgetattr(fd, &test)) != -1)
                 post("\t%d\t%s", i, glob_buffer.gl_pathv[i]);// this one really exists
-                close (fd);
+            close (fd);
         }
     }
 #endif  /* _WIN32 */
@@ -1887,10 +1963,10 @@ static void comport_info(t_comport *x)
 }
 
 /* ---------------- HELPER ------------------------- */
-static void comport_verbose(t_comport *x, t_floatarg f)
+static void comport_set_verbose(t_comport *x, t_floatarg f)
 {
     x->verbose = f;
-    if(f > 0) post("[comport] verbose is on: %d", (int) f);
+    comport_verbose("[comport] verbose is on: %d", (int) f);
 }
 
 static void comport_help(t_comport *x)
@@ -1946,6 +2022,7 @@ void comport_setup(void)
     class_addmethod(comport_class, (t_method)comport_rtscts, gensym("rtscts"), A_FLOAT, 0);
     class_addmethod(comport_class, (t_method)comport_dtr, gensym("dtr"), A_FLOAT, 0);
     class_addmethod(comport_class, (t_method)comport_rts, gensym("rts"), A_FLOAT, 0);
+    class_addmethod(comport_class, (t_method)comport_break, gensym("break"), A_FLOAT, 0);
     class_addmethod(comport_class, (t_method)comport_parity, gensym("parity"), A_FLOAT, 0);
     class_addmethod(comport_class, (t_method)comport_xonxoff, gensym("xonxoff"), A_FLOAT, 0);
     class_addmethod(comport_class, (t_method)comport_hupcl, gensym("hupcl"), A_FLOAT, 0);
@@ -1955,7 +2032,7 @@ void comport_setup(void)
     class_addmethod(comport_class, (t_method)comport_print, gensym("print"), A_GIMME, 0);
     class_addmethod(comport_class, (t_method)comport_pollintervall, gensym("pollintervall"), A_FLOAT, 0);
     class_addmethod(comport_class, (t_method)comport_retries, gensym("retries"), A_FLOAT, 0);
-    class_addmethod(comport_class, (t_method)comport_verbose, gensym("verbose"), A_FLOAT, 0);
+    class_addmethod(comport_class, (t_method)comport_set_verbose, gensym("verbose"), A_FLOAT, 0);
     class_addmethod(comport_class, (t_method)comport_help, gensym("help"), 0);
     class_addmethod(comport_class, (t_method)comport_info, gensym("info"), 0);
     class_addmethod(comport_class, (t_method)comport_devices, gensym("devices"), 0);
@@ -1966,7 +2043,7 @@ void comport_setup(void)
     null_tv.tv_usec = 0;
 #endif /* NOT _WIN32 */
     verbose(-1, "comport - PD external for unix/windows\n"
-        "LGPL 1998-2012,  Winfried Ritsch and others (see LICENSE.txt)\n"
+        "LGPL 1998-2015,  Winfried Ritsch and others (see LICENSE.txt)\n"
         "Institute for Electronic Music - Graz");
 }
 
