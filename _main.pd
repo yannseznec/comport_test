@@ -22,7 +22,7 @@
 #X floatatom 433 190 5 0 0 0 - - -;
 #X obj 433 167 ctlin 16;
 #X obj 433 212 print midi1;
-#X obj 44 179 comport 1 9600;
+#X obj 44 179 comport 0 9600;
 #X connect 0 0 1 0;
 #X connect 1 0 11 0;
 #X connect 2 0 23 0;
